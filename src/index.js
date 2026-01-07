@@ -1,8 +1,8 @@
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const pino = require('pino');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 const { execSync } = require('child_process');
 require('dotenv').config(); // Load environment variables from .env file
 
@@ -11,16 +11,17 @@ function findChromePath() {
     const possiblePaths = [
         'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
         'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-        'C:\\Users\\' + process.env.USERNAME + '\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe',
         'C:\\Users\\' + process.env.USERNAME + '\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe'
     ];
     
     for (const chromePath of possiblePaths) {
         if (fs.existsSync(chromePath)) {
+            console.log(`[DEBUG] Chrome válido encontrado: ${chromePath}`);
             return chromePath;
         }
     }
     
+    console.log('[DEBUG] Chrome não encontrado, usando Chromium embutido');
     return undefined;
 }
 
@@ -37,7 +38,7 @@ const TARGET_GROUP_NAME = process.env.TARGET_GROUP_NAME || "OJ® Streetwear Shop
 const DEDUPE_WINDOW_SECONDS = parseInt(process.env.DEDUPE_WINDOW_SECONDS || "10", 10);
 const MEDIA_SEND_DELAY_MS = parseInt(process.env.MEDIA_SEND_DELAY_MS || "20000", 10); // Reintroduced and set default to 20 seconds
 const LOG_PATH = process.env.LOG_PATH || './wh_relay.log';
-const HEADLESS = process.env.HEADLESS === 'true' || process.env.HEADLESS === true; // Usar .env para controlar headless
+const HEADLESS = false; // Forçar headless=false para garantir QR code
 
 let GLOBAL_PRICE_MULTIPLIER = parseFloat(process.env.GLOBAL_PRICE_MULTIPLIER) || 3; // Usar .env ou default 3, suporta decimais
 
@@ -82,18 +83,15 @@ const logger = pino(
 
     // Encontrar o Chrome no sistema
     const chromePath = findChromePath();
-    if (chromePath) {
-        console.log(`[DEBUG] Chrome encontrado em: ${chromePath}`);
-    } else {
-        console.log('[DEBUG] Chrome não encontrado, usando Chromium embutido');
-    }
+    console.log(`[DEBUG] Chrome encontrado em: ${chromePath}`);
+    console.log('[DEBUG] Chrome não encontrado, usando Chromium embutido');
 
     const client = new Client({
         authStrategy: new LocalAuth({ clientId: 'whatsapp-forwarder' }),
         puppeteer: {
             headless: HEADLESS,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-            executablePath: chromePath || undefined, // Usar Chrome do sistema se disponível
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+            // Não usar Chrome do sistema para evitar erros
         }
     });
 
@@ -105,8 +103,13 @@ const logger = pino(
 
     client.on('qr', (qr) => {
         console.log('\n=== QR CODE PARA AUTENTICAÇÃO ===');
+        console.log('QR Code recebido! Escaneie com seu WhatsApp...');
+        console.log('String QR (para debug):', qr);
+        console.log('Gerando QR Code no terminal...');
         qrcode.generate(qr, { small: true });
-        console.log('=== ESCANEIE O QR CODE ACIMA COM SEU WHATSAPP ===\n');
+        console.log('\n=== ESCANEIE O QR CODE ACIMA COM SEU WHATSAPP ===');
+        console.log('Se não conseguir ver o QR code, verifique se o terminal suporta caracteres Unicode.');
+        console.log('Tente executar em um terminal diferente como Windows Terminal ou CMD clássico.');
         logger.info('QR RECEIVED. Scan with your WhatsApp app.');
     });
 
