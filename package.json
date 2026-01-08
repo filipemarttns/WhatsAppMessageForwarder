@@ -2,12 +2,14 @@
   "name": "whatsapp-forwarder-bot",
   "version": "3.0.0",
   "description": "A WhatsApp bot to forward messages from one group to another using Baileys.",
-  "main": "src/index.js",
+  "main": "src/index_baileys.js",
   "scripts": {
     "start": "node src/index_baileys.js",
-    "build": "node build.js",
+    "clean": "node clean.js",
+    "build": "npm run clean && npm install && npm run build:baileys",
+    "build:baileys": "node build_baileys.js",
     "build:exe": "build.bat",
-    "build:pkg": "pkg src/index.js --targets node18-win-x64,node18-linux-x64 --output bin/whatsapp-forwarder",
+    "build:pkg": "pkg src/index_baileys.js --targets node18-win-x64,node18-linux-x64 --output bin/whatsapp-forwarder",
     "test": "node src/test.js"
   },
   "keywords": [],
@@ -23,5 +25,18 @@
   },
   "devDependencies": {
     "pkg": "^5.8.1"
+  },
+  "pkg": {
+    "scripts": [
+      "src/**/*.js"
+    ],
+    "assets": [
+      "package.json"
+    ],
+    "targets": [
+      "node18-win-x64",
+      "node18-linux-x64"
+    ],
+    "outputPath": "dist"
   }
 }
