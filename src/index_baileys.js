@@ -51,6 +51,7 @@ let sourceGroupIds = [];
 let targetGroup;
 let isReadyToProcessMessages = false;
 const forwardedMessages = new Map();
+const pendingMediaMessages = new Map(); // Armazena mídia aguardando texto
 
 // Função para reconectar
 async function connectToWhatsApp() {
@@ -334,138 +335,71 @@ async function handleMessage(message) {
             timestamp: new Date().toISOString(),
             source_message_id: message.key.id,
             status: 'media_detected',
-        }, 'Message detected with media. Attempting to process...');
+        }, 'Message detected with media. Waiting for text confirmation...');
 
-        try {
-            let mediaType;
-            let mediaBuffer = null;
+        // Se não tem texto, aguardar por mensagem de texto nos próximos 20 segundos
+        if (!modifiedBody || modifiedBody.trim() === '') {
+            logger.info(`Media without text detected. Waiting 20 seconds for accompanying text...`);
+            
+            // Armazenar mídia pendente
+            pendingMediaMessages.set(message.key.id, {
+                message: message,
+                timestamp: Date.now(),
+                processed: false
+            });
 
-            // Try to download media with multiple approaches
-            if (messageContent.imageMessage) {
-                mediaType = 'image';
-                try {
-                    // Try method 1: Direct download
-                    const stream = await downloadContentFromMessage(messageContent.imageMessage, 'image');
-                    const chunks = [];
-                    for await (const chunk of stream) {
-                        chunks.push(chunk);
-                    }
-                    mediaBuffer = Buffer.concat(chunks);
-                } catch (e1) {
-                    try {
-                        // Try method 2: Using message object
-                        const stream = await downloadContentFromMessage(message, 'image');
-                        const chunks = [];
-                        for await (const chunk of stream) {
-                            chunks.push(chunk);
-                        }
-                        mediaBuffer = Buffer.concat(chunks);
-                    } catch (e2) {
-                        logger.warn(`Failed to download image: ${e1.message}, ${e2.message}`);
-                    }
+            // Definir timeout para limpar após 20 segundos
+            setTimeout(() => {
+                const pendingMedia = pendingMediaMessages.get(message.key.id);
+                if (pendingMedia && !pendingMedia.processed) {
+                    logger.info(`No text received within 20 seconds. Discarding standalone media: ${message.key.id}`);
+                    pendingMediaMessages.delete(message.key.id);
                 }
-            } else if (messageContent.videoMessage) {
-                mediaType = 'video';
-                try {
-                    const stream = await downloadContentFromMessage(messageContent.videoMessage, 'video');
-                    const chunks = [];
-                    for await (const chunk of stream) {
-                        chunks.push(chunk);
-                    }
-                    mediaBuffer = Buffer.concat(chunks);
-                } catch (e) {
-                    logger.warn(`Failed to download video: ${e.message}`);
-                }
-            } else if (messageContent.documentMessage) {
-                mediaType = 'document';
-                try {
-                    const stream = await downloadContentFromMessage(messageContent.documentMessage, 'document');
-                    const chunks = [];
-                    for await (const chunk of stream) {
-                        chunks.push(chunk);
-                    }
-                    mediaBuffer = Buffer.concat(chunks);
-                } catch (e) {
-                    logger.warn(`Failed to download document: ${e.message}`);
-                }
-            }
+            }, 20000);
 
-            if (mediaBuffer) {
-                const extension = mediaType === 'image' ? 'jpg' : mediaType === 'video' ? 'mp4' : 'pdf';
-                const filename = `media-${message.key.id}.${extension}`;
-                
-                // Send media first
-                await sock.sendMessage(
-                    targetGroup.id,
-                    {
-                        [mediaType]: mediaBuffer,
-                        caption: '', // No caption for media
-                        fileName: filename
-                    }
-                );
-
-                mediaFilenames.push(filename);
-                logger.info(`Media sent: ${filename}`);
-                
-                // If there's text, apply delay and send as separate message
-                if (modifiedBody && modifiedBody.trim() !== '') {
-                    logger.info(`Applying ${MEDIA_SEND_DELAY_MS}ms delay before sending text message.`);
-                    await new Promise(resolve => setTimeout(resolve, MEDIA_SEND_DELAY_MS));
-                    await sock.sendMessage(targetGroup.id, { text: modifiedBody });
-                    logger.info('Text message sent after media.');
-                }
-            } else {
-                // If download failed, try to forward the message
-                logger.warn('Download failed, attempting to forward message instead');
-                await sock.sendMessage(
-                    targetGroup.id,
-                    { 
-                        forward: message 
-                    },
-                    { 
-                        quoted: message 
-                    }
-                );
-                logger.info(`Message forwarded as fallback`);
-                
-                // Send processed text separately if exists
-                if (modifiedBody && modifiedBody.trim() !== '') {
-                    await new Promise(resolve => setTimeout(resolve, MEDIA_SEND_DELAY_MS));
-                    await sock.sendMessage(targetGroup.id, { text: modifiedBody });
-                    logger.info('Processed text sent after forwarded message.');
-                }
-            }
-
-        } catch (mediaError) {
-            logger.error({
-                timestamp: new Date().toISOString(),
-                source_message_id: message.key.id,
-                author: message.key.participant || message.key.remoteJid,
-                source_group: actualSourceGroupName,
-                original_text: messageBody,
-                media_filenames: [],
-                status: 'error',
-                error_message: `Failed to process media: ${mediaError.message}`,
-            }, 'Error handling media.');
+            return; // Não processar mídia ainda
         }
+
+        // Se tem texto junto com mídia, processar normalmente
+        await processMediaWithText(message, messageContent, modifiedBody, actualSourceGroupName, mediaFilenames);
     } else if (modifiedBody && modifiedBody.trim() !== '') {
-        try {
-            logger.info({ timestamp: new Date().toISOString(), source_message_id: message.key.id, status: 'attempting_send_text_only' }, 'Attempting to send text-only message.');
-            await new Promise(resolve => setTimeout(resolve, MEDIA_SEND_DELAY_MS));
-            await sock.sendMessage(targetGroup.id, { text: modifiedBody });
-            logger.info('Text message (possibly modified) forwarded.');
-        } catch (textError) {
-            logger.error({
-                timestamp: new Date().toISOString(),
-                source_message_id: message.key.id,
-                author: message.key.participant || message.key.remoteJid,
-                source_group: actualSourceGroupName,
-                original_text: messageBody,
-                modified_text: modifiedBody,
-                media_filenames: mediaFilenames,
-                status: 'error',
-                error_message: `Failed to send text message: ${textError.message}`,
-            }, 'Error sending text message.');
+        // Verificar se há mídia pendente para este texto
+        let foundPendingMedia = false;
+        for (const [mediaId, pendingMedia] of pendingMediaMessages.entries()) {
+            if (!pendingMedia.processed && (Date.now() - pendingMedia.timestamp) < 20000) {
+                logger.info(`Found pending media ${mediaId} for text message. Processing together...`);
+                pendingMedia.processed = true;
+                
+                // Processar mídia pendente com este texto
+                const pendingMessageContent = pendingMedia.message.message;
+                await processMediaWithText(pendingMedia.message, pendingMessageContent, modifiedBody, actualSourceGroupName, mediaFilenames);
+                
+                pendingMediaMessages.delete(mediaId);
+                foundPendingMedia = true;
+                break;
+            }
+        }
+
+        // Se não há mídia pendente, enviar apenas texto
+        if (!foundPendingMedia) {
+            try {
+                logger.info({ timestamp: new Date().toISOString(), source_message_id: message.key.id, status: 'attempting_send_text_only' }, 'Attempting to send text-only message.');
+                await new Promise(resolve => setTimeout(resolve, MEDIA_SEND_DELAY_MS));
+                await sock.sendMessage(targetGroup.id, { text: modifiedBody });
+                logger.info('Text message (possibly modified) forwarded.');
+            } catch (textError) {
+                logger.error({
+                    timestamp: new Date().toISOString(),
+                    source_message_id: message.key.id,
+                    author: message.key.participant || message.key.remoteJid,
+                    source_group: actualSourceGroupName,
+                    original_text: messageBody,
+                    modified_text: modifiedBody,
+                    media_filenames: mediaFilenames,
+                    status: 'error',
+                    error_message: `Failed to send text message: ${textError.message}`,
+                }, 'Error sending text message.');
+            }
         }
     }
 
@@ -482,6 +416,122 @@ async function handleMessage(message) {
         status: 'sent',
         error_message: null,
     }, 'Message fully processed and forwarded.');
+}
+
+// Função auxiliar para processar mídia com texto
+async function processMediaWithText(message, messageContent, modifiedBody, actualSourceGroupName, mediaFilenames) {
+    try {
+        let mediaType;
+        let mediaBuffer = null;
+
+        // Try to download media with multiple approaches
+        if (messageContent.imageMessage) {
+            mediaType = 'image';
+            try {
+                // Try method 1: Direct download
+                const stream = await downloadContentFromMessage(messageContent.imageMessage, 'image');
+                const chunks = [];
+                for await (const chunk of stream) {
+                    chunks.push(chunk);
+                }
+                mediaBuffer = Buffer.concat(chunks);
+            } catch (e1) {
+                try {
+                    // Try method 2: Using message object
+                    const stream = await downloadContentFromMessage(message, 'image');
+                    const chunks = [];
+                    for await (const chunk of stream) {
+                        chunks.push(chunk);
+                    }
+                    mediaBuffer = Buffer.concat(chunks);
+                } catch (e2) {
+                    logger.warn(`Failed to download image: ${e1.message}, ${e2.message}`);
+                }
+            }
+        } else if (messageContent.videoMessage) {
+            mediaType = 'video';
+            try {
+                const stream = await downloadContentFromMessage(messageContent.videoMessage, 'video');
+                const chunks = [];
+                for await (const chunk of stream) {
+                    chunks.push(chunk);
+                }
+                mediaBuffer = Buffer.concat(chunks);
+            } catch (e) {
+                logger.warn(`Failed to download video: ${e.message}`);
+            }
+        } else if (messageContent.documentMessage) {
+            mediaType = 'document';
+            try {
+                const stream = await downloadContentFromMessage(messageContent.documentMessage, 'document');
+                const chunks = [];
+                for await (const chunk of stream) {
+                    chunks.push(chunk);
+                }
+                mediaBuffer = Buffer.concat(chunks);
+            } catch (e) {
+                logger.warn(`Failed to download document: ${e.message}`);
+            }
+        }
+
+        if (mediaBuffer) {
+            const extension = mediaType === 'image' ? 'jpg' : mediaType === 'video' ? 'mp4' : 'pdf';
+            const filename = `media-${message.key.id}.${extension}`;
+            
+            // Send media first
+            await sock.sendMessage(
+                targetGroup.id,
+                {
+                    [mediaType]: mediaBuffer,
+                    caption: '', // No caption for media
+                    fileName: filename
+                }
+            );
+
+            mediaFilenames.push(filename);
+            logger.info(`Media sent: ${filename}`);
+            
+            // If there's text, apply delay and send as separate message
+            if (modifiedBody && modifiedBody.trim() !== '') {
+                logger.info(`Applying ${MEDIA_SEND_DELAY_MS}ms delay before sending text message.`);
+                await new Promise(resolve => setTimeout(resolve, MEDIA_SEND_DELAY_MS));
+                await sock.sendMessage(targetGroup.id, { text: modifiedBody });
+                logger.info('Text message sent after media.');
+            }
+        } else {
+            // If download failed, try to forward the message
+            logger.warn('Download failed, attempting to forward message instead');
+            await sock.sendMessage(
+                targetGroup.id,
+                { 
+                    forward: message 
+                },
+                { 
+                    quoted: message 
+                }
+            );
+            logger.info(`Message forwarded as fallback`);
+            
+            // Send processed text separately if exists
+            if (modifiedBody && modifiedBody.trim() !== '') {
+                await new Promise(resolve => setTimeout(resolve, MEDIA_SEND_DELAY_MS));
+                await sock.sendMessage(targetGroup.id, { text: modifiedBody });
+                logger.info('Processed text sent after forwarded message.');
+            }
+        }
+
+    } catch (mediaError) {
+        logger.error({
+            timestamp: new Date().toISOString(),
+            source_message_id: message.key.id,
+            author: message.key.participant || message.key.remoteJid,
+            source_group: actualSourceGroupName,
+            original_text: modifiedBody,
+            media_filenames: [],
+            status: 'error',
+            error_message: `Failed to process media: ${mediaError.message}`,
+        }, 'Error handling media.');
+    }
 }
 
 // Download media function for Baileys
